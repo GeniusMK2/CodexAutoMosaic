@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import random
 import uuid
 import zipfile
 from pathlib import Path
@@ -64,16 +65,60 @@ def detect_sensitive_regions(image_bgr: np.ndarray) -> list[tuple[int, int, int,
         area = cv2.contourArea(contour)
         if area < min_area:
             continue
-        x, y, w, h = cv2.boundingRect(contour)
-        pad_w = int(w * 0.15)
-        pad_h = int(h * 0.15)
-        x1 = max(0, x - pad_w)
-        y1 = max(0, y - pad_h)
-        x2 = min(width, x + w + pad_w)
-        y2 = min(height, y + h + pad_h)
-        regions.append((x1, y1, x2, y2))
 
-    return merge_overlapping_regions(regions)
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 40 or h < 60:
+            continue
+
+        # 仅在候选人体区域内提取重点位置（胸部、下体），避免整块大范围打码。
+        chest_top = y + int(h * 0.24)
+        chest_bottom = y + int(h * 0.48)
+        left_breast = (
+            x + int(w * 0.20),
+            chest_top,
+            x + int(w * 0.43),
+            chest_bottom,
+        )
+        right_breast = (
+            x + int(w * 0.57),
+            chest_top,
+            x + int(w * 0.80),
+            chest_bottom,
+        )
+
+        groin = (
+            x + int(w * 0.34),
+            y + int(h * 0.70),
+            x + int(w * 0.66),
+            y + int(h * 0.90),
+        )
+
+        for x1, y1, x2, y2 in (left_breast, right_breast, groin):
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(width, x2)
+            y2 = min(height, y2)
+            if x2 - x1 > 12 and y2 - y1 > 12:
+                regions.append((x1, y1, x2, y2))
+
+    if regions:
+        return merge_overlapping_regions(regions)
+
+    # 兜底策略：如果未命中重点区域，则仅对肤色候选区域中心位置做小范围遮挡。
+    fallback_regions: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        x1 = max(0, x + int(w * 0.30))
+        y1 = max(0, y + int(h * 0.30))
+        x2 = min(width, x + int(w * 0.70))
+        y2 = min(height, y + int(h * 0.70))
+        if x2 - x1 > 16 and y2 - y1 > 16:
+            fallback_regions.append((x1, y1, x2, y2))
+
+    return merge_overlapping_regions(fallback_regions)
 
 
 def merge_overlapping_regions(regions: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
@@ -117,13 +162,69 @@ def apply_mosaic(image_bgr: np.ndarray, regions: list[tuple[int, int, int, int]]
     return output
 
 
-def process_image(input_path: Path, output_path: Path) -> bool:
+def draw_heart_sticker(output: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> None:
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    w = x2 - x1
+    h = y2 - y1
+    radius = max(8, min(w, h) // 4)
+
+    cv2.circle(output, (cx - radius, cy - radius // 2), radius, (80, 80, 255), -1)
+    cv2.circle(output, (cx + radius, cy - radius // 2), radius, (80, 80, 255), -1)
+    heart_points = np.array(
+        [[cx - 2 * radius, cy], [cx + 2 * radius, cy], [cx, cy + 2 * radius]],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(output, [heart_points], (80, 80, 255))
+    cv2.rectangle(output, (x1, y1), (x2, y2), (245, 245, 245), 2)
+
+
+def draw_paw_sticker(output: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> None:
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    w = x2 - x1
+    h = y2 - y1
+    pad_radius = max(7, min(w, h) // 6)
+    toe_radius = max(4, pad_radius // 2)
+
+    color = (80, 150, 255)
+    cv2.circle(output, (cx, cy + pad_radius // 2), pad_radius, color, -1)
+    toe_offsets = [
+        (-pad_radius, -pad_radius),
+        (-pad_radius // 3, -int(pad_radius * 1.2)),
+        (pad_radius // 3, -int(pad_radius * 1.2)),
+        (pad_radius, -pad_radius),
+    ]
+    for ox, oy in toe_offsets:
+        cv2.circle(output, (cx + ox, cy + oy), toe_radius, color, -1)
+    cv2.rectangle(output, (x1, y1), (x2, y2), (245, 245, 245), 2)
+
+
+def apply_sticker(image_bgr: np.ndarray, regions: list[tuple[int, int, int, int]], style: str) -> np.ndarray:
+    output = image_bgr.copy()
+    for x1, y1, x2, y2 in regions:
+        current_style = style
+        if style == "mix":
+            current_style = random.choice(["mosaic", "heart", "paw"])
+
+        if current_style == "mosaic":
+            output = apply_mosaic(output, [(x1, y1, x2, y2)])
+        elif current_style == "heart":
+            draw_heart_sticker(output, x1, y1, x2, y2)
+        elif current_style == "paw":
+            draw_paw_sticker(output, x1, y1, x2, y2)
+        else:
+            output = apply_mosaic(output, [(x1, y1, x2, y2)])
+    return output
+
+
+def process_image(input_path: Path, output_path: Path, style: str = "mix") -> bool:
     image = cv2.imread(str(input_path))
     if image is None:
         return False
 
     regions = detect_sensitive_regions(image)
-    processed = apply_mosaic(image, regions)
+    processed = apply_sticker(image, regions, style)
     cv2.imwrite(str(output_path), processed)
     return True
 
@@ -137,6 +238,9 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload_images():
     files = request.files.getlist("images")
+    style = request.form.get("style", "mix")
+    if style not in {"mix", "mosaic", "heart", "paw"}:
+        style = "mix"
     if not files:
         flash("请至少选择一张图片。", "error")
         return redirect(url_for("index"))
@@ -160,7 +264,7 @@ def upload_images():
         output_path = result_batch_dir / output_name
 
         file.save(input_path)
-        ok = process_image(input_path, output_path)
+        ok = process_image(input_path, output_path, style=style)
         if ok:
             results.append({
                 "original": f"uploads/{batch_id}/{filename}",
