@@ -23,6 +23,15 @@
 
       <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
         <input type="file" name="images" accept="image/*" multiple required />
+        <label>
+          打码样式
+          <select name="style">
+            <option value="mix" selected>智能混合（马赛克+爱心+爪印）</option>
+            <option value="mosaic">仅马赛克</option>
+            <option value="heart">仅爱心贴纸</option>
+            <option value="paw">仅动物爪印贴纸</option>
+          </select>
+        </label>
         <button type="submit">上传并打码</button>
       </form>
 
