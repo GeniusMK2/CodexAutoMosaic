@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import io
+import uuid
+import zipfile
+from pathlib import Path
+
+import cv2
+import numpy as np
+from flask import (
+    Flask,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
+from werkzeug.utils import secure_filename
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+RESULT_DIR = BASE_DIR / "results"
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp"}
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "change-this-secret-key"
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
+
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def detect_sensitive_regions(image_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """
+    基于肤色区域的启发式检测。
+    实际业务中可替换为更专业的人体/敏感区域检测模型。
+    """
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    lower1 = np.array([0, 30, 40], dtype=np.uint8)
+    upper1 = np.array([25, 220, 255], dtype=np.uint8)
+
+    lower2 = np.array([160, 30, 40], dtype=np.uint8)
+    upper2 = np.array([180, 220, 255], dtype=np.uint8)
+
+    mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    height, width = image_bgr.shape[:2]
+    min_area = max((height * width) // 200, 1200)
+
+    regions: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        pad_w = int(w * 0.15)
+        pad_h = int(h * 0.15)
+        x1 = max(0, x - pad_w)
+        y1 = max(0, y - pad_h)
+        x2 = min(width, x + w + pad_w)
+        y2 = min(height, y + h + pad_h)
+        regions.append((x1, y1, x2, y2))
+
+    return merge_overlapping_regions(regions)
+
+
+def merge_overlapping_regions(regions: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if not regions:
+        return []
+
+    regions = sorted(regions, key=lambda r: (r[0], r[1]))
+    merged: list[list[int]] = []
+
+    for region in regions:
+        x1, y1, x2, y2 = region
+        found = False
+        for m in merged:
+            mx1, my1, mx2, my2 = m
+            overlap_x = not (x2 < mx1 or x1 > mx2)
+            overlap_y = not (y2 < my1 or y1 > my2)
+            if overlap_x and overlap_y:
+                m[0] = min(mx1, x1)
+                m[1] = min(my1, y1)
+                m[2] = max(mx2, x2)
+                m[3] = max(my2, y2)
+                found = True
+                break
+        if not found:
+            merged.append([x1, y1, x2, y2])
+
+    return [tuple(item) for item in merged]
+
+
+def apply_mosaic(image_bgr: np.ndarray, regions: list[tuple[int, int, int, int]], block_size: int = 18) -> np.ndarray:
+    output = image_bgr.copy()
+    for x1, y1, x2, y2 in regions:
+        roi = output[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+        small_w = max(1, (x2 - x1) // block_size)
+        small_h = max(1, (y2 - y1) // block_size)
+        small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        mosaic = cv2.resize(small, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+        output[y1:y2, x1:x2] = mosaic
+    return output
+
+
+def process_image(input_path: Path, output_path: Path) -> bool:
+    image = cv2.imread(str(input_path))
+    if image is None:
+        return False
+
+    regions = detect_sensitive_regions(image)
+    processed = apply_mosaic(image, regions)
+    cv2.imwrite(str(output_path), processed)
+    return True
+
+
+@app.route("/", methods=["GET"])
+def index():
+    results = session.get("results", [])
+    return render_template("index.html", results=results)
+
+
+@app.route("/upload", methods=["POST"])
+def upload_images():
+    files = request.files.getlist("images")
+    if not files:
+        flash("请至少选择一张图片。", "error")
+        return redirect(url_for("index"))
+
+    batch_id = uuid.uuid4().hex
+    upload_batch_dir = UPLOAD_DIR / batch_id
+    result_batch_dir = RESULT_DIR / batch_id
+    upload_batch_dir.mkdir(parents=True, exist_ok=True)
+    result_batch_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for file in files:
+        if not file or file.filename == "":
+            continue
+        if not allowed_file(file.filename):
+            continue
+
+        filename = secure_filename(file.filename)
+        input_path = upload_batch_dir / filename
+        output_name = f"mosaic_{filename}"
+        output_path = result_batch_dir / output_name
+
+        file.save(input_path)
+        ok = process_image(input_path, output_path)
+        if ok:
+            results.append({
+                "original": f"uploads/{batch_id}/{filename}",
+                "processed": f"results/{batch_id}/{output_name}",
+                "name": output_name,
+            })
+
+    if not results:
+        flash("未处理任何图片，请检查文件格式。", "error")
+        return redirect(url_for("index"))
+
+    session["results"] = results
+    session["batch_id"] = batch_id
+    flash(f"处理完成，共 {len(results)} 张图片。", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/download/all", methods=["GET"])
+def download_all():
+    batch_id = session.get("batch_id")
+    if not batch_id:
+        flash("暂无可下载内容。", "error")
+        return redirect(url_for("index"))
+
+    result_batch_dir = RESULT_DIR / batch_id
+    if not result_batch_dir.exists():
+        flash("批次结果已过期。", "error")
+        return redirect(url_for("index"))
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for image_file in result_batch_dir.iterdir():
+            if image_file.is_file():
+                zf.write(image_file, arcname=image_file.name)
+
+    zip_buffer.seek(0)
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"mosaic_{batch_id}.zip",
+    )
+
+
+@app.route("/<path:filepath>")
+def serve_generated(filepath: str):
+    file_path = BASE_DIR / filepath
+    if not file_path.exists() or not file_path.is_file():
+        return "Not found", 404
+    return send_file(file_path)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)

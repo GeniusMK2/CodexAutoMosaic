@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>自动打码工具</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>图片自动识别并打码</h1>
+      <p class="hint">支持单张/批量上传，自动识别敏感区域并打码。</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <ul class="messages">
+            {% for category, message in messages %}
+              <li class="{{ category }}">{{ message }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      {% endwith %}
+
+      <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+        <input type="file" name="images" accept="image/*" multiple required />
+        <button type="submit">上传并打码</button>
+      </form>
+
+      {% if results %}
+      <section>
+        <div class="actions">
+          <h2>处理结果预览</h2>
+          <a class="download-btn" href="/download/all">批量下载 ZIP</a>
+        </div>
+        <div class="grid">
+          {% for item in results %}
+          <article class="card">
+            <h3>{{ item.name }}</h3>
+            <div class="comparison">
+              <figure>
+                <figcaption>原图</figcaption>
+                <img src="/{{ item.original }}" alt="original" />
+              </figure>
+              <figure>
+                <figcaption>打码后</figcaption>
+                <img src="/{{ item.processed }}" alt="processed" />
+              </figure>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+    </main>
+  </body>
+</html>
