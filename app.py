@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import random
 import uuid
 import zipfile
@@ -32,16 +33,87 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = "change-this-secret-key"
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
+DETECTOR_MODE = os.getenv("SENSITIVE_DETECTOR", "auto").strip().lower()
+YOLO_MODEL_NAME = os.getenv("YOLO_MODEL", "yolov8n.pt").strip()
+YOLO_CONF = float(os.getenv("YOLO_CONFIDENCE", "0.35"))
+_YOLO_MODEL = None
+_YOLO_READY = False
+
 
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def detect_sensitive_regions(image_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """
-    基于肤色区域的启发式检测。
-    实际业务中可替换为更专业的人体/敏感区域检测模型。
-    """
+def get_yolo_model():
+    global _YOLO_MODEL, _YOLO_READY
+    if _YOLO_READY:
+        return _YOLO_MODEL
+
+    _YOLO_READY = True
+    try:
+        from ultralytics import YOLO
+    except Exception:
+        _YOLO_MODEL = None
+        return None
+
+    try:
+        _YOLO_MODEL = YOLO(YOLO_MODEL_NAME)
+    except Exception:
+        _YOLO_MODEL = None
+
+    return _YOLO_MODEL
+
+
+def detect_person_regions_by_yolo(image_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    model = get_yolo_model()
+    if model is None:
+        return []
+
+    try:
+        prediction = model.predict(
+            source=image_bgr,
+            conf=YOLO_CONF,
+            classes=[0],
+            verbose=False,
+        )
+    except Exception:
+        return []
+
+    if not prediction:
+        return []
+
+    height, width = image_bgr.shape[:2]
+    regions: list[tuple[int, int, int, int]] = []
+    for box in prediction[0].boxes:
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        x2 = min(width, int(x2))
+        y2 = min(height, int(y2))
+        if x2 - x1 < 40 or y2 - y1 < 80:
+            continue
+
+        person_w = x2 - x1
+        person_h = y2 - y1
+        chest_region = (
+            x1 + int(person_w * 0.16),
+            y1 + int(person_h * 0.20),
+            x1 + int(person_w * 0.84),
+            y1 + int(person_h * 0.58),
+        )
+        groin_region = (
+            x1 + int(person_w * 0.24),
+            y1 + int(person_h * 0.62),
+            x1 + int(person_w * 0.76),
+            y1 + int(person_h * 0.95),
+        )
+        regions.extend([chest_region, groin_region])
+
+    return merge_overlapping_regions(regions)
+
+
+def detect_sensitive_regions_heuristic(image_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """基于肤色区域的启发式检测。"""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
     lower1 = np.array([0, 30, 40], dtype=np.uint8)
@@ -128,6 +200,21 @@ def detect_sensitive_regions(image_bgr: np.ndarray) -> list[tuple[int, int, int,
             fallback_regions.append((x1, y1, x2, y2))
 
     return merge_overlapping_regions(fallback_regions)
+
+
+def detect_sensitive_regions(image_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """
+    敏感区域检测入口：
+    1) auto/yolo: 优先使用 YOLO 人体检测，再映射重点遮挡区域；
+    2) 未安装模型或推理失败时，自动回退到启发式检测。
+    """
+    use_yolo = DETECTOR_MODE in {"auto", "yolo"}
+    if use_yolo:
+        yolo_regions = detect_person_regions_by_yolo(image_bgr)
+        if yolo_regions:
+            return yolo_regions
+
+    return detect_sensitive_regions_heuristic(image_bgr)
 
 
 def merge_overlapping_regions(regions: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
