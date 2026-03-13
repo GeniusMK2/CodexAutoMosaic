@@ -70,27 +70,36 @@ def detect_sensitive_regions(image_bgr: np.ndarray) -> list[tuple[int, int, int,
         if w < 40 or h < 60:
             continue
 
-        # 仅在候选人体区域内提取重点位置（胸部、下体），避免整块大范围打码。
-        chest_top = y + int(h * 0.24)
-        chest_bottom = y + int(h * 0.48)
+        aspect_ratio = h / max(w, 1)
+        if aspect_ratio < 0.85:
+            continue
+
+        roi_mask = mask[y : y + h, x : x + w]
+        skin_ratio = float(cv2.countNonZero(roi_mask)) / float(w * h)
+        if skin_ratio < 0.20:
+            continue
+
+        # 仅在候选人体区域内提取重点位置（胸部、下体），并适当放大覆盖范围。
+        chest_top = y + int(h * 0.18)
+        chest_bottom = y + int(h * 0.56)
         left_breast = (
-            x + int(w * 0.20),
+            x + int(w * 0.12),
             chest_top,
-            x + int(w * 0.43),
+            x + int(w * 0.47),
             chest_bottom,
         )
         right_breast = (
-            x + int(w * 0.57),
+            x + int(w * 0.53),
             chest_top,
-            x + int(w * 0.80),
+            x + int(w * 0.88),
             chest_bottom,
         )
 
         groin = (
-            x + int(w * 0.34),
-            y + int(h * 0.70),
-            x + int(w * 0.66),
-            y + int(h * 0.90),
+            x + int(w * 0.25),
+            y + int(h * 0.62),
+            x + int(w * 0.75),
+            y + int(h * 0.95),
         )
 
         for x1, y1, x2, y2 in (left_breast, right_breast, groin):
